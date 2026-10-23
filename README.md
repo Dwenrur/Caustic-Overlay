@@ -92,4 +92,4 @@ Quick on/off any time: right-click the tray icon → **Message sound**.
 
 ## Upgrading
 
-Copy your old `settings.json` into this folder to keep your colours and window position.
+Copy your old `settings.json` into the Caustic Overlay folder located in AppData/Roaming/Caustic Overlay.
