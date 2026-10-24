@@ -5,7 +5,7 @@
 ; Also cleans up the old "MultiChat Overlay" install (same app, old name) if it's there.
 
 #ifndef AppVersion
-  #define AppVersion "17"
+  #define AppVersion "18"
 #endif
 #define AppName "Caustic Overlay"
 #define AppExe "Caustic Overlay.exe"

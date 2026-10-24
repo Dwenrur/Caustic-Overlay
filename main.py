@@ -1,6 +1,11 @@
-"""Caustic Overlay - Windows desktop overlay (v17).
+"""Caustic Overlay - Windows desktop overlay (v18).
 
 Merges Twitch, Kick and YouTube chat into one transparent overlay.
+
+v18 changes:
+- Font picker: any font installed on your PC (Settings -> Appearance).
+- Text thickness: Light, Regular, Semibold, Bold or Extra bold.
+- Fading is now an on/off option (off by default), in the new Messages tab.
 
 v17 changes:
 - Messages can fade out after a delay (Settings -> Appearance -> Fade after;
@@ -127,7 +132,7 @@ CONFIG_PATH = DATA_DIR / "settings.json"
 MIGRATED_MARKER = ".moved-from-multichat-overlay"
 ICON_PATH = RESOURCE_DIR / "icon.ico"
 APP_ID = "CausticOverlay.App"
-APP_VERSION = "v17"
+APP_VERSION = "v18"
 LOG_PATH = DATA_DIR / "connection_log.txt"
 SOUNDS_DIR = DATA_DIR / "sounds"                    # your own sounds are copied here
 BUILTIN_SOUND = RESOURCE_DIR / "sounds" / "chime.wav"
@@ -163,7 +168,9 @@ DEFAULTS = {
     "sound_volume": 60,             # 0-100 %
     "sound_file": "",               # "" = built-in chime; else a path (relative to this folder if inside it)
     "sound_cooldown": 1.0,          # seconds: at most one sound this often, so busy chat isn't a drumroll
-    "fade_after": 30,               # seconds a message stays before fading out; 0 = never fade
+    "fade_enabled": False,          # fade old messages out (optional)
+    "fade_after": 30,               # seconds a message stays before it fades
+    "text_weight": "regular",       # message text thickness: light/regular/semibold/bold/black
     "fade_background": False,       # also fade the panel when every message has faded
 }
 
@@ -179,6 +186,14 @@ ERROR_COLOR = "#F87171"
 SETTINGS_SIZE = (430, 760)
 MAX_STORED_MESSAGES = 200
 FADE_SECONDS = 1.5                  # how long the fade-out itself takes
+# Message text thickness: (setting value, label, family-name suffixes to look for, fallback weight)
+TEXT_WEIGHTS = [
+    ("light", "Light", ("Light", "Semilight", "SemiLight"), "normal"),
+    ("regular", "Regular", (), "normal"),
+    ("semibold", "Semibold", ("Semibold", "SemiBold", "Demibold", "DemiBold", "Medium"), "bold"),
+    ("bold", "Bold", (), "bold"),
+    ("black", "Extra bold", ("Black", "Heavy", "ExtraBold", "Extra Bold"), "bold"),
+]
 FADE_FRAME = 0.06                   # seconds between fade animation frames (~16 fps)
 
 CARD_COLOR = "#202330"
@@ -675,6 +690,8 @@ class CausticOverlay:
         self._card_rects: list[tuple[int, int, int, int]] = []
         self._card_colors: list[str] = []
         self._mix_cache: dict = {}
+        self._families: list[str] | None = None
+        self._weight_cache: dict = {}
         self._fade_after_id = None
         self._backdrop_alpha_now: float | None = None
         self._font_cache: dict = {}
@@ -1134,13 +1151,57 @@ class CausticOverlay:
             msg["arrived"] = arrived
         self._showing_demo = True
 
-    def _font(self, size: int, bold: bool = False) -> tkfont.Font:
-        key = (self.settings["font_family"], size, bold)
+    def _font(self, size: int, bold: bool = False, family: str | None = None) -> tkfont.Font:
+        key = (family or self.settings["font_family"], size, bold)
         font = self._font_cache.get(key)
         if font is None:
             font = tkfont.Font(root=self.root, family=key[0], size=size, weight="bold" if bold else "normal")
             self._font_cache[key] = font
         return font
+
+    def installed_fonts(self) -> list[str]:
+        """Font families on this PC, A-Z (vertical "@" variants left out)."""
+        if self._families is None:
+            names = {f for f in tkfont.families(self.root) if f and not f.startswith("@")}
+            self._families = sorted(names, key=str.lower)
+        return self._families
+
+    def _weight_variant(self, family: str, weight: str) -> tuple[str, bool]:
+        """(family, bold) that gives the requested thickness with this font.
+
+        Windows lists a font's extra weights as separate families ("Segoe UI Semibold",
+        "Segoe UI Light", "Arial Black"...). Use one if the font has it; otherwise
+        fall back to plain or bold.
+        """
+        cache_key = (family, weight)
+        if cache_key in self._weight_cache:
+            return self._weight_cache[cache_key]
+        result = (family, weight == "bold")
+        for value, _label, suffixes, fallback in TEXT_WEIGHTS:
+            if value != weight:
+                continue
+            installed = {f.lower(): f for f in self.installed_fonts()}
+            base = family
+            for suffix in ("Light", "Semilight", "SemiLight", "Semibold", "SemiBold", "Demibold", "Medium",
+                           "Black", "Heavy", "ExtraBold"):
+                if family.endswith(" " + suffix):         # picked a variant directly: use its base name
+                    base = family[: -len(suffix) - 1]
+                    break
+            for suffix in suffixes:
+                hit = installed.get(f"{base} {suffix}".lower())
+                if hit:
+                    result = (hit, False)
+                    break
+            else:
+                result = (family if not suffixes else base, fallback == "bold")
+            break
+        self._weight_cache[cache_key] = result
+        return result
+
+    def _body_font(self, size: int) -> tkfont.Font:
+        """Font for message text: the chosen family at the chosen thickness."""
+        family, bold = self._weight_variant(self.settings["font_family"], self.settings.get("text_weight", "regular"))
+        return self._font(size, bold=bold, family=family)
 
     def _render_messages(self):
         """Redraw chat on the canvas, newest at the bottom.
@@ -1166,7 +1227,7 @@ class CausticOverlay:
 
         if not self.messages:
             c.create_text(0, 6, text="Waiting for chat messages…", anchor="nw",
-                          fill=self.settings["text_color"], font=self._font(font_size))
+                          fill=self.settings["text_color"], font=self._body_font(font_size))
         else:
             # Lay out bottom-up; anything above the top edge is simply clipped,
             # so the oldest messages are the ones that get cut off.
@@ -1196,10 +1257,12 @@ class CausticOverlay:
 
     def _fade_delay(self) -> float:
         """Seconds a message stays fully visible before it starts to fade (0 = never fade)."""
-        try:
-            return max(0.0, float(self.settings.get("fade_after", 0)))
-        except (TypeError, ValueError):
+        if not self.settings.get("fade_enabled", False):
             return 0.0
+        try:
+            return max(1.0, float(self.settings.get("fade_after", 30)))
+        except (TypeError, ValueError):
+            return 30.0
 
     def _fade_amount(self, msg: dict, now: float) -> float:
         """0.0 = fully visible ... 1.0 = completely faded (and no longer drawn)."""
@@ -1301,7 +1364,7 @@ class CausticOverlay:
             line_bottom = max(line_bottom, c.bbox(item)[3])
         body = c.create_text(CARD_PADX, line_bottom + 3, text=msg["message"], anchor="nw",
                              width=max(80, width - 2 * CARD_PADX), fill=text_color,
-                             font=self._font(font_size), tags=(tag,))
+                             font=self._body_font(font_size), tags=(tag,))
         card_height = c.bbox(body)[3] + CARD_PADY
         top = bottom - card_height
         c.move(tag, 0, top)
@@ -1328,7 +1391,7 @@ class CausticOverlay:
                                font=self._font(max(7, font_size - 3)), tags=(tag,))
             right = c.bbox(ts)[0] - 4
         c.create_text(x, 0, text=msg["message"], anchor="nw", width=max(60, right - x),
-                      fill=text_color, font=self._font(font_size), tags=(tag,))
+                      fill=text_color, font=self._body_font(font_size), tags=(tag,))
         row_height = c.bbox(tag)[3]
         top = bottom - row_height
         c.move(tag, 0, top)
@@ -1375,17 +1438,34 @@ class CausticOverlay:
         notebook.pack(fill="both", expand=True, padx=8, pady=(8, 8))
         body = ttk.Frame(notebook, padding=12)
         notebook.add(body, text="Appearance")
+        msgs = ttk.Frame(notebook, padding=12)
+        notebook.add(msgs, text="Messages")
         conn = ttk.Frame(notebook, padding=12)
         notebook.add(conn, text="Connections")
         sound_tab = ttk.Frame(notebook, padding=12)
         notebook.add(sound_tab, text="Sound")
-        self._settings_tabs = (notebook, body, conn, sound_tab)
+        self._settings_tabs = (notebook, body, conn, sound_tab, msgs)
 
         style_var = tk.StringVar(value=self.settings["style"])
         style_row = ttk.Frame(body); style_row.pack(fill="x", pady=3)
         ttk.Label(style_row, text="Overlay style").pack(side="left")
         style_combo = ttk.Combobox(style_row, textvariable=style_var, values=("custom", "minimal"), state="readonly", width=12)
         style_combo.pack(side="right")
+
+        # Font: any family installed on this PC. Thickness: real weights where the font has them.
+        family_var = tk.StringVar(value=self.settings["font_family"])
+        font_row = ttk.Frame(body); font_row.pack(fill="x", pady=3)
+        ttk.Label(font_row, text="Font").pack(side="left")
+        family_combo = ttk.Combobox(font_row, textvariable=family_var, values=self.installed_fonts(),
+                                    state="readonly", width=24, height=20)
+        family_combo.pack(side="right")
+        weight_labels = {value: label for value, label, _s, _f in TEXT_WEIGHTS}
+        weight_values = {label: value for value, label in weight_labels.items()}
+        weight_var = tk.StringVar(value=weight_labels.get(self.settings.get("text_weight", "regular"), "Regular"))
+        weight_row = ttk.Frame(body); weight_row.pack(fill="x", pady=3)
+        ttk.Label(weight_row, text="Text thickness").pack(side="left")
+        ttk.Combobox(weight_row, textvariable=weight_var, values=list(weight_labels.values()),
+                     state="readonly", width=12).pack(side="right")
 
         opacity_var = tk.DoubleVar(value=self._opacity())
         if self.two_window:
@@ -1399,10 +1479,7 @@ class CausticOverlay:
         spacing_var = tk.DoubleVar(value=float(self.settings["message_spacing"]))
         spacing_scale = self._setting_slider(body, "Message spacing", spacing_var, 0, 24, "{:.0f} px")
         limit_var = tk.DoubleVar(value=float(self.settings["max_messages"]))
-        limit_scale = self._setting_slider(body, "Visible messages", limit_var, 1, 40, "{:.0f}")
-        fade_var = tk.DoubleVar(value=self._fade_delay())
-        fade_scale = self._setting_slider(body, "Fade after", fade_var, 0, 300,
-                                          lambda v: "Never" if round(v) <= 0 else f"{round(v)} s")
+        limit_scale = self._setting_slider(msgs, "Visible messages", limit_var, 1, 40, "{:.0f}")
 
         ttk.Separator(body).pack(fill="x", pady=9)
         ttk.Label(body, text="Colors", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
@@ -1425,13 +1502,33 @@ class CausticOverlay:
         ttk.Label(body, text="Window", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
         top_var = tk.BooleanVar(value=bool(self.settings["always_on_top"]))
         ttk.Checkbutton(body, text="Always on top", variable=top_var).pack(anchor="w")
+
+        # ---- Messages tab
         labels_var = tk.BooleanVar(value=bool(self.settings["show_platform_labels"]))
-        ttk.Checkbutton(body, text="Show platform labels (custom style)", variable=labels_var).pack(anchor="w")
+        ttk.Checkbutton(msgs, text="Show platform labels (custom style)", variable=labels_var).pack(anchor="w", pady=(6, 0))
         timestamps_var = tk.BooleanVar(value=bool(self.settings["show_timestamps"]))
-        ttk.Checkbutton(body, text="Show timestamps", variable=timestamps_var).pack(anchor="w")
+        ttk.Checkbutton(msgs, text="Show timestamps", variable=timestamps_var).pack(anchor="w")
+        ttk.Separator(msgs).pack(fill="x", pady=9)
+        ttk.Label(msgs, text="Fading", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
+        fade_on_var = tk.BooleanVar(value=bool(self.settings.get("fade_enabled", False)))
+        ttk.Checkbutton(msgs, text="Fade out old messages", variable=fade_on_var).pack(anchor="w")
+        fade_var = tk.DoubleVar(value=max(1.0, float(self.settings.get("fade_after", 30) or 30)))
+        fade_scale = self._setting_slider(msgs, "Fade after", fade_var, 1, 300, lambda v: f"{round(v)} s")
         fade_bg_var = tk.BooleanVar(value=bool(self.settings.get("fade_background", False)))
-        ttk.Checkbutton(body, text="Fade the background too when chat goes quiet",
-                        variable=fade_bg_var).pack(anchor="w")
+        fade_bg_check = ttk.Checkbutton(msgs, text="Fade the background too when chat goes quiet",
+                                        variable=fade_bg_var)
+        fade_bg_check.pack(anchor="w")
+        ttk.Label(msgs, wraplength=370, foreground="#52525B",
+                  text="Each message stays for the time above, then fades out over about a second and a half. "
+                       "With the background option, the panel fades too once every message is gone, "
+                       "and comes back with the next message.").pack(anchor="w", pady=(8, 0))
+
+        def sync_fade_controls(*_):
+            state = ["!disabled"] if fade_on_var.get() else ["disabled"]
+            fade_scale.state(state)
+            fade_bg_check.state(state)
+        fade_on_var.trace_add("write", sync_fade_controls)
+        sync_fade_controls()
 
         ttk.Label(body, text="Ctrl+Shift+X toggles click-through (chat only, no border). "
                              "Right-click the tray icon → Show border to bring it back.",
@@ -1447,7 +1544,10 @@ class CausticOverlay:
                 "message_spacing": int(round(spacing_var.get())), "max_messages": int(round(limit_var.get())),
                 "always_on_top": bool(top_var.get()), "show_platform_labels": bool(labels_var.get()),
                 "show_timestamps": bool(timestamps_var.get()),
-                "fade_after": int(round(fade_var.get())), "fade_background": bool(fade_bg_var.get()),
+                "fade_enabled": bool(fade_on_var.get()), "fade_after": max(1, int(round(fade_var.get()))),
+                "fade_background": bool(fade_bg_var.get()),
+                "font_family": family_var.get() or DEFAULTS["font_family"],
+                "text_weight": weight_values.get(weight_var.get(), "regular"),
             })
             for key, var in color_vars.items():
                 self.settings[key] = var.get()
@@ -1520,7 +1620,8 @@ class CausticOverlay:
 
         # Every control previews immediately; changes are persisted only by Save.
         for variable in (style_var, opacity_var, font_var, spacing_var, limit_var,
-                         top_var, labels_var, timestamps_var, fade_var, fade_bg_var, *color_vars.values()):
+                         top_var, labels_var, timestamps_var, fade_var, fade_bg_var, fade_on_var,
+                         family_var, weight_var, *color_vars.values()):
             variable.trace_add("write", preview)
         # Explicit Scale callbacks ensure redraws occur during slider drags on Windows/Tk builds
         # where variable traces may not reliably refresh the overlay until the drag ends.
