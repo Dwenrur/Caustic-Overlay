@@ -1,6 +1,11 @@
-"""Caustic Overlay - Windows desktop overlay (v16.1).
+"""Caustic Overlay - Windows desktop overlay (v17).
 
 Merges Twitch, Kick and YouTube chat into one transparent overlay.
+
+v17 changes:
+- Messages can fade out after a delay (Settings -> Appearance -> Fade after;
+  default 30 s, "Never" turns it off). Optionally the background panel fades
+  too, so the overlay disappears completely while chat is quiet.
 
 v16.1 changes:
 - New icon: a green, dripping "C" (window, taskbar, tray, installer, desktop shortcut).
@@ -122,7 +127,7 @@ CONFIG_PATH = DATA_DIR / "settings.json"
 MIGRATED_MARKER = ".moved-from-multichat-overlay"
 ICON_PATH = RESOURCE_DIR / "icon.ico"
 APP_ID = "CausticOverlay.App"
-APP_VERSION = "v16.1"
+APP_VERSION = "v17"
 LOG_PATH = DATA_DIR / "connection_log.txt"
 SOUNDS_DIR = DATA_DIR / "sounds"                    # your own sounds are copied here
 BUILTIN_SOUND = RESOURCE_DIR / "sounds" / "chime.wav"
@@ -158,6 +163,8 @@ DEFAULTS = {
     "sound_volume": 60,             # 0-100 %
     "sound_file": "",               # "" = built-in chime; else a path (relative to this folder if inside it)
     "sound_cooldown": 1.0,          # seconds: at most one sound this often, so busy chat isn't a drumroll
+    "fade_after": 30,               # seconds a message stays before fading out; 0 = never fade
+    "fade_background": False,       # also fade the panel when every message has faded
 }
 
 # Everything platform-specific the UI needs, in display order.
@@ -171,6 +178,8 @@ STATUS_GLYPH = {"connecting": "…", "live": "●", "waiting": "○", "error": "
 ERROR_COLOR = "#F87171"
 SETTINGS_SIZE = (430, 760)
 MAX_STORED_MESSAGES = 200
+FADE_SECONDS = 1.5                  # how long the fade-out itself takes
+FADE_FRAME = 0.06                   # seconds between fade animation frames (~16 fps)
 
 CARD_COLOR = "#202330"
 MUTED_COLOR = "#A1A1AA"
@@ -664,6 +673,10 @@ class CausticOverlay:
         # what made v10 flash, so everything is compared against this first.
         self._applied: dict = {}
         self._card_rects: list[tuple[int, int, int, int]] = []
+        self._card_colors: list[str] = []
+        self._mix_cache: dict = {}
+        self._fade_after_id = None
+        self._backdrop_alpha_now: float | None = None
         self._font_cache: dict = {}
         self._item_seq = 0
         self.backdrop: tk.Toplevel | None = None
@@ -980,13 +993,16 @@ class CausticOverlay:
         self._style_backdrop()
         self._restack_backdrop()
 
-    def _style_backdrop(self):
-        """Backdrop is always click-through and never takes focus; its alpha is the opacity setting."""
+    def _style_backdrop(self, alpha: float | None = None):
+        """Backdrop is always click-through and never takes focus; its alpha is the opacity setting
+        (or lower while the panel is fading out)."""
         if self.backdrop is None or not self._backdrop_visible:
             return
+        alpha = self._opacity() if alpha is None else alpha
+        self._backdrop_alpha_now = alpha
         if not IS_WINDOWS:
             try:
-                self.backdrop.attributes("-alpha", self._opacity())
+                self.backdrop.attributes("-alpha", alpha)
             except tk.TclError:
                 pass
             return
@@ -995,7 +1011,7 @@ class CausticOverlay:
             return
         try:
             update_exstyle(hwnd, add=WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
-            win32().set_layered(hwnd, self._opacity())
+            win32().set_layered(hwnd, alpha)
         except Exception as exc:
             self._clickthrough_error = f"backdrop: {exc}"
             self._update_footer()
@@ -1113,6 +1129,9 @@ class CausticOverlay:
             {"platform": "twitch", "username": "ViewerTwo", "message": "Huge", "time": now},
             {"platform": "kick", "username": "KickFan", "message": "GG", "time": now},
         ]
+        arrived = self._clock()
+        for msg in self.messages:
+            msg["arrived"] = arrived
         self._showing_demo = True
 
     def _font(self, size: int, bold: bool = False) -> tkfont.Font:
@@ -1132,6 +1151,7 @@ class CausticOverlay:
         c = self.chat_canvas
         c.delete("all")
         self._card_rects = []
+        self._card_colors = []
         width, height = c.winfo_width(), c.winfo_height()
         if width <= 1 or height <= 1:
             return  # not laid out yet; the canvas <Configure> event will redraw
@@ -1139,29 +1159,114 @@ class CausticOverlay:
         font_size = max(8, min(24, int(self.settings["font_size"])))
         spacing = max(0, min(24, int(self.settings["message_spacing"])))
         limit = max(1, min(100, int(self.settings["max_messages"])))
-        visible = self.messages[-limit:]
+        now = self._clock()
+        # Fully faded messages are skipped, so the rest close up at the bottom.
+        live = [(m, f) for m in self.messages if (f := self._fade_amount(m, now)) < 1.0]
+        visible = live[-limit:]
 
-        if not visible:
+        if not self.messages:
             c.create_text(0, 6, text="Waiting for chat messages…", anchor="nw",
                           fill=self.settings["text_color"], font=self._font(font_size))
         else:
             # Lay out bottom-up; anything above the top edge is simply clipped,
             # so the oldest messages are the ones that get cut off.
             bottom = height
-            for msg in reversed(visible):
+            for msg, fade in reversed(visible):
                 if bottom <= 0:
                     break
                 if minimal:
-                    top = self._draw_minimal_row(msg, bottom, width, font_size)
+                    top = self._draw_minimal_row(msg, bottom, width, font_size, fade)
                 else:
-                    top = self._draw_card(msg, bottom, width, font_size)
+                    top = self._draw_card(msg, bottom, width, font_size, fade)
                 bottom = top - spacing
 
         if not self.two_window and not minimal:
             # Single-window fallback: cards are drawn here, beneath the text.
-            for rect in self._card_rects:
-                c.tag_lower(c.create_rectangle(*rect, fill=CARD_COLOR, width=0))
+            for rect, color in zip(self._card_rects, self._card_colors):
+                c.tag_lower(c.create_rectangle(*rect, fill=color, width=0))
         self._render_backdrop()
+        self._fade_background([f for _m, f in visible])
+        self._schedule_fade_tick(now)
+
+    # ------------------------------------------------------------------- fading
+
+    @staticmethod
+    def _clock() -> float:
+        return time.monotonic()
+
+    def _fade_delay(self) -> float:
+        """Seconds a message stays fully visible before it starts to fade (0 = never fade)."""
+        try:
+            return max(0.0, float(self.settings.get("fade_after", 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fade_amount(self, msg: dict, now: float) -> float:
+        """0.0 = fully visible ... 1.0 = completely faded (and no longer drawn)."""
+        delay = self._fade_delay()
+        if delay <= 0:
+            return 0.0
+        age = now - msg.get("arrived", now)
+        if age <= delay:
+            return 0.0
+        return min(1.0, (age - delay) / FADE_SECONDS)
+
+    def _mix(self, color: str, target: str, amount: float) -> str:
+        """Blend a colour toward `target` (the panel colour). With the panel keyed see-through,
+        text blended all the way into it has nothing left to show."""
+        if amount <= 0:
+            return color
+        key = (color, target)
+        cache = self._mix_cache
+        if key not in cache:
+            if len(cache) > 256:
+                cache.clear()
+            cache[key] = (self._rgb(color), self._rgb(target))
+        (r1, g1, b1), (r2, g2, b2) = cache[key]
+        a = min(1.0, amount)
+        return "#%02x%02x%02x" % (round(r1 + (r2 - r1) * a), round(g1 + (g2 - g1) * a), round(b1 + (b2 - b1) * a))
+
+    def _schedule_fade_tick(self, now: float) -> None:
+        """Redraw again only when something is (or is about to start) fading."""
+        if self._fade_after_id is not None:
+            try:
+                self.root.after_cancel(self._fade_after_id)
+            except tk.TclError:
+                pass
+            self._fade_after_id = None
+        delay = self._fade_delay()
+        if delay <= 0 or not self.messages:
+            return
+        next_in = None
+        for msg in self.messages:
+            age = now - msg.get("arrived", now)
+            if age < delay:                                   # still solid: wake when it starts fading
+                wait = delay - age
+            elif age < delay + FADE_SECONDS:                  # fading right now: animate
+                wait = FADE_FRAME
+            else:
+                continue                                      # already gone
+            next_in = wait if next_in is None else min(next_in, wait)
+        if next_in is not None:
+            self._fade_after_id = self.root.after(max(15, int(next_in * 1000)), self._fade_tick)
+
+    def _fade_tick(self) -> None:
+        self._fade_after_id = None
+        if self.root.winfo_exists():
+            self._render_messages()
+
+    def _fade_background(self, fades: list[float]) -> None:
+        """Optionally fade the panel too, so the overlay vanishes completely when chat is quiet."""
+        if not (self.two_window and self.backdrop is not None and self._backdrop_visible):
+            return
+        if self.settings.get("fade_background") and self._fade_delay() > 0 and self.messages:
+            remaining = 1.0 - min(fades) if fades else 0.0       # the freshest message decides
+        else:
+            remaining = 1.0
+        alpha = round(self._opacity() * remaining, 3)
+        if alpha != self._backdrop_alpha_now:
+            self._backdrop_alpha_now = alpha
+            self._style_backdrop(alpha)
 
     def _new_tag(self) -> str:
         self._item_seq += 1
@@ -1171,10 +1276,13 @@ class CausticOverlay:
         info = PLATFORMS.get(platform)
         return self.settings.get(info["color_key"], MUTED_COLOR) if info else MUTED_COLOR
 
-    def _draw_card(self, msg: dict, bottom: int, width: int, font_size: int) -> int:
+    def _draw_card(self, msg: dict, bottom: int, width: int, font_size: int, fade: float = 0.0) -> int:
         """Custom style: header line (platform, user, time) + wrapped message. Returns the card's top y."""
         c, tag = self.chat_canvas, self._new_tag()
-        pcolor = self._platform_color(msg["platform"])
+        panel = self.settings["panel_color"]
+        pcolor = self._mix(self._platform_color(msg["platform"]), panel, fade)
+        text_color = self._mix(self.settings["text_color"], panel, fade)
+        muted = self._mix(MUTED_COLOR, panel, fade)
         small = max(7, font_size - 3)
         name_font = self._font(font_size, bold=True)
         mid = CARD_PADY + name_font.metrics("linespace") // 2   # vertical centre of the header line
@@ -1189,21 +1297,25 @@ class CausticOverlay:
         line_bottom = c.bbox(item)[3]
         if self.settings.get("show_timestamps", False):
             item = c.create_text(width - CARD_PADX, mid, text=msg.get("time", ""), anchor="e",
-                                 fill=MUTED_COLOR, font=self._font(small), tags=(tag,))
+                                 fill=muted, font=self._font(small), tags=(tag,))
             line_bottom = max(line_bottom, c.bbox(item)[3])
         body = c.create_text(CARD_PADX, line_bottom + 3, text=msg["message"], anchor="nw",
-                             width=max(80, width - 2 * CARD_PADX), fill=self.settings["text_color"],
+                             width=max(80, width - 2 * CARD_PADX), fill=text_color,
                              font=self._font(font_size), tags=(tag,))
         card_height = c.bbox(body)[3] + CARD_PADY
         top = bottom - card_height
         c.move(tag, 0, top)
         self._card_rects.append((0, top, width, bottom))
+        self._card_colors.append(self._mix(CARD_COLOR, panel, fade))
         return top
 
-    def _draw_minimal_row(self, msg: dict, bottom: int, width: int, font_size: int) -> int:
+    def _draw_minimal_row(self, msg: dict, bottom: int, width: int, font_size: int, fade: float = 0.0) -> int:
         """Minimal style: [T] user: message, wrapped with a hanging indent. Returns the row's top y."""
         c, tag = self.chat_canvas, self._new_tag()
-        pcolor = self._platform_color(msg["platform"])
+        panel = self.settings["panel_color"]
+        pcolor = self._mix(self._platform_color(msg["platform"]), panel, fade)
+        text_color = self._mix(self.settings["text_color"], panel, fade)
+        muted = self._mix(MUTED_COLOR, panel, fade)
         bold = self._font(font_size, bold=True)
         prefix = PLATFORMS.get(msg["platform"], {}).get("short", "?")
         item = c.create_text(0, 0, text=f"[{prefix}]", anchor="nw", fill=pcolor, font=bold, tags=(tag,))
@@ -1212,11 +1324,11 @@ class CausticOverlay:
         x = c.bbox(item)[2]
         right = width
         if self.settings.get("show_timestamps", False):
-            ts = c.create_text(width, 0, text=f" {msg.get('time', '')}", anchor="ne", fill=MUTED_COLOR,
+            ts = c.create_text(width, 0, text=f" {msg.get('time', '')}", anchor="ne", fill=muted,
                                font=self._font(max(7, font_size - 3)), tags=(tag,))
             right = c.bbox(ts)[0] - 4
         c.create_text(x, 0, text=msg["message"], anchor="nw", width=max(60, right - x),
-                      fill=self.settings["text_color"], font=self._font(font_size), tags=(tag,))
+                      fill=text_color, font=self._font(font_size), tags=(tag,))
         row_height = c.bbox(tag)[3]
         top = bottom - row_height
         c.move(tag, 0, top)
@@ -1233,10 +1345,11 @@ class CausticOverlay:
         ox = self.chat_canvas.winfo_rootx() - self.root.winfo_rootx()
         oy = self.chat_canvas.winfo_rooty() - self.root.winfo_rooty()
         ch = self.chat_canvas.winfo_height()
-        for x1, y1, x2, y2 in self._card_rects:
+        colors = self._card_colors or [CARD_COLOR] * len(self._card_rects)
+        for (x1, y1, x2, y2), color in zip(self._card_rects, colors):
             y1 = max(y1, 0)   # clip to the chat area so cards don't slide under the header
             if y2 > y1:
-                bc.create_rectangle(x1 + ox, y1 + oy, x2 + ox, min(y2, ch) + oy, fill=CARD_COLOR, width=0)
+                bc.create_rectangle(x1 + ox, y1 + oy, x2 + ox, min(y2, ch) + oy, fill=color, width=0)
 
     # ---------------------------------------------------------------- settings
 
@@ -1287,6 +1400,9 @@ class CausticOverlay:
         spacing_scale = self._setting_slider(body, "Message spacing", spacing_var, 0, 24, "{:.0f} px")
         limit_var = tk.DoubleVar(value=float(self.settings["max_messages"]))
         limit_scale = self._setting_slider(body, "Visible messages", limit_var, 1, 40, "{:.0f}")
+        fade_var = tk.DoubleVar(value=self._fade_delay())
+        fade_scale = self._setting_slider(body, "Fade after", fade_var, 0, 300,
+                                          lambda v: "Never" if round(v) <= 0 else f"{round(v)} s")
 
         ttk.Separator(body).pack(fill="x", pady=9)
         ttk.Label(body, text="Colors", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
@@ -1313,6 +1429,9 @@ class CausticOverlay:
         ttk.Checkbutton(body, text="Show platform labels (custom style)", variable=labels_var).pack(anchor="w")
         timestamps_var = tk.BooleanVar(value=bool(self.settings["show_timestamps"]))
         ttk.Checkbutton(body, text="Show timestamps", variable=timestamps_var).pack(anchor="w")
+        fade_bg_var = tk.BooleanVar(value=bool(self.settings.get("fade_background", False)))
+        ttk.Checkbutton(body, text="Fade the background too when chat goes quiet",
+                        variable=fade_bg_var).pack(anchor="w")
 
         ttk.Label(body, text="Ctrl+Shift+X toggles click-through (chat only, no border). "
                              "Right-click the tray icon → Show border to bring it back.",
@@ -1328,6 +1447,7 @@ class CausticOverlay:
                 "message_spacing": int(round(spacing_var.get())), "max_messages": int(round(limit_var.get())),
                 "always_on_top": bool(top_var.get()), "show_platform_labels": bool(labels_var.get()),
                 "show_timestamps": bool(timestamps_var.get()),
+                "fade_after": int(round(fade_var.get())), "fade_background": bool(fade_bg_var.get()),
             })
             for key, var in color_vars.items():
                 self.settings[key] = var.get()
@@ -1400,7 +1520,7 @@ class CausticOverlay:
 
         # Every control previews immediately; changes are persisted only by Save.
         for variable in (style_var, opacity_var, font_var, spacing_var, limit_var,
-                         top_var, labels_var, timestamps_var, *color_vars.values()):
+                         top_var, labels_var, timestamps_var, fade_var, fade_bg_var, *color_vars.values()):
             variable.trace_add("write", preview)
         # Explicit Scale callbacks ensure redraws occur during slider drags on Windows/Tk builds
         # where variable traces may not reliably refresh the overlay until the drag ends.
@@ -1415,6 +1535,7 @@ class CausticOverlay:
         font_scale.configure(command=lambda value: scale_changed(value, font_var))
         spacing_scale.configure(command=lambda value: scale_changed(value, spacing_var))
         limit_scale.configure(command=lambda value: scale_changed(value, limit_var))
+        fade_scale.configure(command=lambda value: scale_changed(value, fade_var))
         win.update_idletasks()
         # Center the larger settings window relative to the overlay, keeping the buttons visible.
         x = max(0, self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2)
@@ -1579,7 +1700,8 @@ class CausticOverlay:
         scale = ttk.Scale(row, from_=low, to=high, variable=variable, orient="horizontal")
         scale.pack(side="left", fill="x", expand=True, padx=(5, 8))
         def update(*_):
-            value_label.configure(text=fmt.format(float(variable.get())))
+            value = float(variable.get())
+            value_label.configure(text=fmt(value) if callable(fmt) else fmt.format(value))
         variable.trace_add("write", update); update()
         return scale
 
@@ -1803,7 +1925,7 @@ class CausticOverlay:
         if kind == "chat":
             if self._showing_demo:                 # first real message: drop the sample chat
                 self.messages, self._showing_demo = [], False
-            self.messages.append({"platform": platform, **payload})
+            self.messages.append({"platform": platform, **payload, "arrived": self._clock()})
             self._new_chat += 1
             return True
         if kind == "delete":
