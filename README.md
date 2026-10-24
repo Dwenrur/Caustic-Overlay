@@ -67,7 +67,7 @@ Every connection step is written to **`connection_log.txt`** in this folder. Sen
 
 **v13.1 fix:** in mid-October 2026 Kick changed the key its chat server accepts, so the old key was refused ("server closed the connection"). The overlay now asks Kick for the current key every time it connects, and has the new key built in as a backup.
 
-## Message sound (new in v14)
+## Message sound (new in v1.0.1)
 
 A short chime plays when new chat arrives. Set it up in **Settings → Sound**:
 
@@ -79,6 +79,24 @@ A short chime plays when new chat arrives. Set it up in **Settings → Sound**:
 - **▶ Test**: play it now.
 
 Quick on/off any time: right-click the tray icon → **Message sound**.
+
+## Font and text thickness (new in v1.0.2)
+
+In **Settings → Appearance**:
+
+- **Font**: pick any font installed on your PC. Usernames and messages both use it.
+- **Text thickness**: **Light, Regular, Semibold, Bold** or **Extra bold** for message text. Fonts that come in those weights (Segoe UI, Bahnschrift, Arial Black…) use the real weight; others fall back to the nearest plain or bold.
+
+## Fading messages (optional)
+
+**Settings → Messages → Fading**. Off by default.
+
+- **Fade out old messages**: turn fading on or off.
+- **Fade after**: how long a message stays before it fades, 1–300 seconds (default 30 s).
+- **Fade the background too when chat goes quiet**: once every message has faded, the panel fades as well; a new message brings it back.
+
+The **Messages** tab also has **Visible messages**, **Show platform labels** and **Show timestamps**.
+
 
 ## Chat-only mode
 
