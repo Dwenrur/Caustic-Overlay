@@ -89,7 +89,3 @@ Quick on/off any time: right-click the tray icon → **Message sound**.
 - **Resize grip:** the purple diagonal lines in the bottom-right corner.
 - **Background opacity:** fades the panel; text stays solid.
 - **Overlays** only show over games in **windowed** or **borderless windowed** mode, not exclusive fullscreen.
-
-## Upgrading
-
-Copy your old `settings.json` into the Caustic Overlay folder located in AppData/Roaming/Caustic Overlay.
