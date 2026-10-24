@@ -14,7 +14,7 @@ MultiChat Overlay is now **Caustic Overlay**. If you installed the old version, 
 
 ## Install it as a normal Windows program
 
-1. Double-click **`Caustic-Overlay-Setup-v16.1.exe`**. No admin rights needed. You get:
+1. Double-click **`Caustic-Overlay-Setup-'version'.exe`**. No admin rights needed. You get:
    - a Start Menu shortcut, plus an optional desktop shortcut and optional "start when Windows starts",
    - an uninstaller in **Settings → Apps**.
 
