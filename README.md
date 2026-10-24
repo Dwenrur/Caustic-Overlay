@@ -1,4 +1,4 @@
-# Caustic Overlay (v16.1)
+# Caustic Overlay
 
 A transparent chat overlay for Windows that merges **Twitch, Kick and YouTube** chat into one window over your game.
 
